@@ -17,6 +17,6 @@ ENV API_TOKEN=changeme \
     BASE_DIR=/data \
     OUT_DIR=/output
 
-EXPOSE 8080
+EXPOSE 3256
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "3256"]
 
