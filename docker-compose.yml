@@ -3,7 +3,7 @@ version: "3.8"
 services:
   zipper:
     image: zipper-api:25.10.27
-    name: zipper
+    container_name: zipper
     build:
       context: .
       dockerfile: Dockerfile
