@@ -6,19 +6,7 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-
-
-API_TOKEN = get_api_token()
-if API_TOKEN == "changeme":
-    raise RuntimeError("API token not configured")
-BASE_DIR = Path(os.environ.get("BASE_DIR", "/data")).resolve()
-OUT_DIR = Path(os.environ.get("OUT_DIR", "/output")).resolve()
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-app = FastAPI(title="7zip API", version="1.0.0")
-
-import os
-import logging
+from logging
 
 def get_api_token(default="changeme") -> str:
     # 1) Prefer file, if provided
@@ -42,6 +30,14 @@ def get_api_token(default="changeme") -> str:
     # 3) Final fallback
     return default
 
+API_TOKEN = get_api_token()
+if API_TOKEN == "changeme":
+    raise RuntimeError("API token not configured")
+BASE_DIR = Path(os.environ.get("BASE_DIR", "/data")).resolve()
+OUT_DIR = Path(os.environ.get("OUT_DIR", "/output")).resolve()
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(title="7zip API", version="1.0.0")
 
 def _require_auth(authorization: Optional[str]):
     if not API_TOKEN:
