@@ -7,7 +7,12 @@ from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-API_TOKEN = os.environ.get("API_TOKEN", "changeme")
+_token = os.environ.get("API_TOKEN")
+_token_file = os.environ.get("API_TOKEN_FILE")
+if not _token and _token_file and os.path.exists(_token_file):
+    with open(_token_file, "r") as f:
+        _token = f.read().strip()
+API_TOKEN = _token or "changeme"
 BASE_DIR = Path(os.environ.get("BASE_DIR", "/data")).resolve()
 OUT_DIR = Path(os.environ.get("OUT_DIR", "/output")).resolve()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
