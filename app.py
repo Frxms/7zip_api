@@ -62,7 +62,7 @@ class UnzipReq(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "base_path": str(BASE_DIR), "out_path": str(OUT_DIR)}
+    return {"status": "ok", "base_path": str(BASE_DIR), "out_path": str(OUT_DIR), "last_token_digits": str(API_TOKEN[-3:])}
 
 @app.post("/zip-folder")
 def zip_folder(req: ZipFolderReq, authorization: Optional[str] = Header(default=None)):
