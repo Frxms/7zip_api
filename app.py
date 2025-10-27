@@ -6,7 +6,7 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from logging
+import logging
 
 def get_api_token(default="changeme") -> str:
     # 1) Prefer file, if provided
