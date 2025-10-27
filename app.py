@@ -7,17 +7,41 @@ from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-_token = os.environ.get("API_TOKEN")
-_token_file = os.environ.get("API_TOKEN_FILE")
-if not _token and _token_file and os.path.exists(_token_file):
-    with open(_token_file, "r") as f:
-        _token = f.read().strip()
-API_TOKEN = _token or "changeme"
+
+API_TOKEN = get_api_token()
+if API_TOKEN == "changeme":
+    raise RuntimeError("API token not configured")
 BASE_DIR = Path(os.environ.get("BASE_DIR", "/data")).resolve()
 OUT_DIR = Path(os.environ.get("OUT_DIR", "/output")).resolve()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="7zip API", version="1.0.0")
+
+import os
+import logging
+
+def get_api_token(default="changeme") -> str:
+    # 1) Prefer file, if provided
+    token_path = os.getenv("API_TOKEN_FILE")
+    if token_path and os.path.isfile(token_path):
+        try:
+            with open(token_path, "r", encoding="utf-8") as f:
+                token = f.read().strip()
+            if token:
+                return token
+            else:
+                logging.warning("API_TOKEN_FILE is empty: %s", token_path)
+        except Exception as e:
+            logging.warning("Failed to read API_TOKEN_FILE %s: %s", token_path, e)
+
+    # 2) Fallback to env var
+    token = os.getenv("API_TOKEN")
+    if token:
+        return token.strip()
+
+    # 3) Final fallback
+    return default
+
 
 def _require_auth(authorization: Optional[str]):
     if not API_TOKEN:
