@@ -2,20 +2,19 @@ version: "3.8"
 
 services:
   zipper:
-    # Use the image you built/pushed. If you built it on this host already:
-    image: zipper-api:dev
-    container_name: zipper
-    # Runs as appuser (uid 1000) from your Dockerfile
+    image: zipper-api:dev          # the name to give the built image locally
+    build:
+      context: .
+      dockerfile: Dockerfile
+    pull_policy: build             # force build instead of pull in standalone
     environment:
       - BASE_DIR=/data
       - OUT_DIR=/output
-      - API_TOKEN_FILE=/run/secret/token   # <<< read token from file
+      - API_TOKEN_FILE=/run/secret/token
     ports:
       - "3256:3256"
     volumes:
-      # Host folders -> container
       - /srv/assistant/assistant-zipper/in:/data:ro
       - /srv/assistant/assistant-zipper/out:/output:rw
-      # Secret file (read-only) -> container
       - /srv/assistant/assistant-zipper/secret/token:/run/secret/token:ro
     restart: unless-stopped
