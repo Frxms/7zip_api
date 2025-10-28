@@ -52,20 +52,38 @@ def _require_auth(authorization: Optional[str]):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 def _safe_path(p: str) -> Path:
-    rp = Path(p).resolve()
-    # must be inside BASE_DIR (or BASE_DIR itself)
+    """
+    Resolve a path safely under BASE_DIR.
+    - Relative input is treated as relative to BASE_DIR.
+    - Absolute input must still resolve under BASE_DIR.
+    """
+    cand = Path(p)
+    rp = (BASE_DIR / cand).resolve() if not cand.is_absolute() else cand.resolve()
     if not str(rp).startswith(str(BASE_DIR) + os.sep) and str(rp) != str(BASE_DIR):
-        raise HTTPException(status_code=400, detail="Path outside allowed base")
+        raise HTTPException(status_code=400, detail=f"Path outside allowed base: {rp}")
     return rp
 
 def _safe_out(name: str) -> Path:
-    # ensure output stays in OUT_DIR and no traversal
+    """
+    Ensure an output path remains within OUT_DIR and prevent traversal.
+    Creates parent directories if needed.
+    """
     out = (OUT_DIR / name).resolve()
     if not str(out).startswith(str(OUT_DIR) + os.sep) and str(out) != str(OUT_DIR):
-        raise HTTPException(status_code=400, detail="Invalid output name")
-    # create parent dirs just in case the name contains subfolders
+        raise HTTPException(status_code=400, detail=f"Invalid output name: {out}")
     out.parent.mkdir(parents=True, exist_ok=True)
     return out
+
+def _ensure_under_out(p: Path):
+    if not str(p).startswith(str(OUT_DIR) + os.sep) and str(p) != str(OUT_DIR):
+        raise HTTPException(status_code=400, detail=f"Destination escapes OUT_DIR: {p}")
+
+def _unique_path(base: Path) -> Path:
+    """Return a unique path by appending a short suffix if the path exists."""
+    if not base.exists():
+        return base
+    suffix = "-" + uuid.uuid4().hex[:6]
+    return base.with_name(base.name + suffix)
 
 def _run_7z(args: list, cwd: Optional[Path] = None):
     try:
@@ -84,17 +102,6 @@ def _run_7z(args: list, cwd: Optional[Path] = None):
             status_code=500,
             detail=f"7z failed: {(e.stderr or e.stdout or str(e)).strip()}",
         )
-
-def _unique_path(base: Path) -> Path:
-    """Return a unique path (appends -<shortuuid> if the path exists)."""
-    if not base.exists():
-        return base
-    suffix = "-" + uuid.uuid4().hex[:6]
-    return base.with_name(base.name + suffix)
-
-def _ensure_under_out(p: Path):
-    if not str(p).startswith(str(OUT_DIR) + os.sep) and str(p) != str(OUT_DIR):
-        raise HTTPException(status_code=400, detail="Destination escapes OUT_DIR")
 
 
 # ---- Schemas ----
@@ -129,9 +136,12 @@ def health():
 def zip_folder(req: ZipFolderReq, authorization: Optional[str] = Header(default=None)):
     _require_auth(authorization)
 
+    logging.info("zip request: folder=%r archive_name=%r recursive=%r format=%r",
+                 req.folder, req.archive_name, req.recursive, req.format)
+
     src = _safe_path(req.folder)
     if not src.exists() or not src.is_dir():
-        raise HTTPException(status_code=404, detail="Folder not found")
+        raise HTTPException(status_code=404, detail=f"Folder not found: {src}")
 
     out = _safe_out(req.archive_name)
     fmt = (req.format or "zip").lower()
@@ -139,7 +149,7 @@ def zip_folder(req: ZipFolderReq, authorization: Optional[str] = Header(default=
         raise HTTPException(status_code=400, detail="format must be 'zip' or '7z'")
 
     # 7z syntax: 7z a [options] <archive> <files...>
-    # We run inside 'src' and add '.'; recursion with -r if requested.
+    # Run inside 'src' and add '.'; recursion with -r if requested.
     options = []
     tflag = "-t7z" if fmt == "7z" else "-tzip"
     options.append(tflag)
@@ -165,22 +175,23 @@ def zip_folder(req: ZipFolderReq, authorization: Optional[str] = Header(default=
 @app.post("/unzip-archive")
 def unzip_archive(req: UnzipReq, authorization: Optional[str] = Header(default=None)):
     _require_auth(authorization)
+    logging.info(
+        "unzip request: folder=%r archive_name=%r dest_dir=%r overwrite=%r",
+        req.folder, req.archive_name, req.dest_dir, req.overwrite
+    )
 
     # Source folder (where the archive is) must be inside BASE_DIR
     src_folder = _safe_path(req.folder)
     if not src_folder.exists() or not src_folder.is_dir():
-        raise HTTPException(status_code=404, detail="Source folder not found")
+        raise HTTPException(status_code=404, detail=f"Source folder not found: {src_folder}")
 
     archive_path = (src_folder / req.archive_name).resolve()
-
-    # Ensure the archive is within BASE_DIR
     if not str(archive_path).startswith(str(BASE_DIR) + os.sep) and str(archive_path) != str(BASE_DIR):
-        raise HTTPException(status_code=400, detail="Archive path outside allowed base")
-
+        raise HTTPException(status_code=400, detail=f"Archive path outside allowed base: {archive_path}")
     if not archive_path.exists() or not archive_path.is_file():
-        raise HTTPException(status_code=404, detail="Archive file not found")
+        raise HTTPException(status_code=404, detail=f"Archive file not found: {archive_path}")
 
-    # ---- Decide final target folder (one and only one) ----
+    # ---- Decide final target folder (single level) ----
     archive_stem = archive_path.stem  # e.g. "invoices" from "invoices.zip"
     final_dir = (OUT_DIR / (req.dest_dir or archive_stem)).resolve()
     _ensure_under_out(final_dir)
@@ -208,23 +219,21 @@ def unzip_archive(req: UnzipReq, authorization: Optional[str] = Header(default=N
     try:
         _run_7z(cmd)
     except HTTPException:
-        # Cleanup temp on failure
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise
 
     # ---- Normalize to a single folder level ----
-    # Case A: temp contains exactly one directory -> that directory becomes final_dir
+    # If temp contains exactly one directory, use it as final_dir; else wrap all items into final_dir.
     entries = list(temp_dir.iterdir())
     if len(entries) == 1 and entries[0].is_dir():
-        # Just rename/move that directory to final_dir
+        # Move that single directory to final_dir (no extra nesting)
         entries[0].replace(final_dir)
     else:
-        # Case B: multiple items or files at root -> create final_dir and move all into it
         final_dir.mkdir(parents=True, exist_ok=False)
         for p in entries:
             shutil.move(str(p), str(final_dir))
 
-    # Remove temp dir (should be empty now)
+    # Cleanup temp directory
     shutil.rmtree(temp_dir, ignore_errors=True)
 
     # Return a small manifest (top-level entries only)
