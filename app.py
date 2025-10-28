@@ -1,7 +1,9 @@
 import os
+import shutil
 import subprocess
+import uuid
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import FileResponse
@@ -83,46 +85,16 @@ def _run_7z(args: list, cwd: Optional[Path] = None):
             detail=f"7z failed: {(e.stderr or e.stdout or str(e)).strip()}",
         )
 
-def _detect_single_root_dir(archive_path: Path) -> Optional[str]:
-    """
-    Inspect archive contents and return the single top-level component name
-    if (and only if) every entry starts with the same first path segment.
-    Uses `7z l -slt` for a parseable output.
-    """
-    try:
-        res = subprocess.run(
-            ["7z", "l", "-slt", str(archive_path)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except subprocess.CalledProcessError as e:
-        logging.warning("Failed to list archive for root detection: %s", e)
-        return None
+def _unique_path(base: Path) -> Path:
+    """Return a unique path (appends -<shortuuid> if the path exists)."""
+    if not base.exists():
+        return base
+    suffix = "-" + uuid.uuid4().hex[:6]
+    return base.with_name(base.name + suffix)
 
-    top_levels = set()
-    for line in res.stdout.splitlines():
-        # Lines look like: "Path = dir/file.txt"
-        if line.startswith("Path = "):
-            rel = line[len("Path = "):].strip()
-            if not rel:
-                continue
-            # normalize separator to '/'
-            rel = rel.replace("\\", "/")
-            first = rel.split("/", 1)[0]
-            top_levels.add(first)
-
-            # If we ever see a top-level *file* (no '/'), that still counts as a top-level name,
-            # but it means the archive has root files, so there is not a single root directory "container".
-            # We'll keep collecting; decision happens after loop.
-
-            if len(top_levels) > 1:
-                # more than one top-level right away -> not a single root dir
-                return None
-
-    if len(top_levels) == 1:
-        return next(iter(top_levels))
-    return None
+def _ensure_under_out(p: Path):
+    if not str(p).startswith(str(OUT_DIR) + os.sep) and str(p) != str(OUT_DIR):
+        raise HTTPException(status_code=400, detail="Destination escapes OUT_DIR")
 
 
 # ---- Schemas ----
@@ -137,8 +109,8 @@ class UnzipReq(BaseModel):
     folder: str                 # directory under BASE_DIR where the archive resides
     archive_name: str           # e.g., "archive.zip" or "archive.7z"
     password: Optional[str] = None
-    dest_dir: Optional[str] = None  # subdir under OUT_DIR; default derived smartly
-    overwrite: str = "skip"     # "skip" (-aos), "overwrite" (-aoa), or "rename" (-aou)
+    dest_dir: Optional[str] = None  # final folder name under OUT_DIR (optional)
+    overwrite: str = "skip"     # "skip", "overwrite", or "rename"
 
 
 # ---- Routes ----
@@ -208,47 +180,62 @@ def unzip_archive(req: UnzipReq, authorization: Optional[str] = Header(default=N
     if not archive_path.exists() or not archive_path.is_file():
         raise HTTPException(status_code=404, detail="Archive file not found")
 
-    # ---- NEW: smart destination to avoid double-nesting ----
-    if req.dest_dir:
-        dest = (OUT_DIR / req.dest_dir).resolve()
-    else:
-        embedded_root = _detect_single_root_dir(archive_path)
-        archive_stem = archive_path.stem
+    # ---- Decide final target folder (one and only one) ----
+    archive_stem = archive_path.stem  # e.g. "invoices" from "invoices.zip"
+    final_dir = (OUT_DIR / (req.dest_dir or archive_stem)).resolve()
+    _ensure_under_out(final_dir)
 
-        if embedded_root and embedded_root == archive_stem:
-            # The archive already contains a single top-level folder that matches the stem.
-            # Extract directly into OUT_DIR so we only get ONE folder (the embedded one).
-            dest = OUT_DIR
-        else:
-            # Otherwise, create a folder named after the archive to contain the files.
-            dest = (OUT_DIR / archive_stem).resolve()
+    # Overwrite policy at folder level
+    mode = (req.overwrite or "skip").lower()
+    if final_dir.exists():
+        if mode == "overwrite":
+            shutil.rmtree(final_dir)
+        elif mode == "rename":
+            final_dir = _unique_path(final_dir)
+        else:  # skip
+            raise HTTPException(status_code=409, detail=f"Destination exists: {final_dir}")
 
-    if not str(dest).startswith(str(OUT_DIR) + os.sep) and str(dest) != str(OUT_DIR):
-        raise HTTPException(status_code=400, detail="Invalid destination path")
+    # ---- Extract to temp dir first ----
+    temp_dir = (OUT_DIR / f".extract-{archive_stem}-{uuid.uuid4().hex[:8]}").resolve()
+    _ensure_under_out(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
 
-    dest.mkdir(parents=True, exist_ok=True)
-
-    # Overwrite policy mapping
-    ow_map = {"skip": "-aos", "overwrite": "-aoa", "rename": "-aou"}
-    ow_flag = ow_map.get((req.overwrite or "skip").lower(), "-aos")
-
-    # 7z extract: 7z x <archive> -o<dest> <overwrite-flag> -y [-p...]
-    cmd = ["7z", "x", str(archive_path), f"-o{str(dest)}", ow_flag, "-y"]
+    cmd = ["7z", "x", str(archive_path), f"-o{str(temp_dir)}", "-y"]
     if req.password:
         cmd.append(f"-p{req.password}")
 
     logging.info("Running 7z (unzip) with args: %s", cmd)
-    _run_7z(cmd)
+    try:
+        _run_7z(cmd)
+    except HTTPException:
+        # Cleanup temp on failure
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+    # ---- Normalize to a single folder level ----
+    # Case A: temp contains exactly one directory -> that directory becomes final_dir
+    entries = list(temp_dir.iterdir())
+    if len(entries) == 1 and entries[0].is_dir():
+        # Just rename/move that directory to final_dir
+        entries[0].replace(final_dir)
+    else:
+        # Case B: multiple items or files at root -> create final_dir and move all into it
+        final_dir.mkdir(parents=True, exist_ok=False)
+        for p in entries:
+            shutil.move(str(p), str(final_dir))
+
+    # Remove temp dir (should be empty now)
+    shutil.rmtree(temp_dir, ignore_errors=True)
 
     # Return a small manifest (top-level entries only)
     try:
-        entries = sorted([p.name for p in dest.iterdir()])
+        top_entries = sorted([p.name for p in final_dir.iterdir()])
     except Exception:
-        entries = []
+        top_entries = []
 
     return {
         "status": "ok",
         "archive": str(archive_path),
-        "extracted_to": str(dest),
-        "entries_top_level": entries[:200]
+        "extracted_to": str(final_dir),
+        "entries_top_level": top_entries[:200]
     }
