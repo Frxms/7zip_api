@@ -1,7 +1,7 @@
 import os
 import subprocess
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional, List, Tuple
 
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import FileResponse
@@ -74,7 +74,6 @@ def _run_7z(args: list, cwd: Optional[Path] = None):
             capture_output=True,
             text=True,
         )
-        # Log a truncated stdout for diagnostics
         if res.stdout:
             logging.info("7z stdout (trunc): %s", res.stdout[:1000])
     except subprocess.CalledProcessError as e:
@@ -83,6 +82,47 @@ def _run_7z(args: list, cwd: Optional[Path] = None):
             status_code=500,
             detail=f"7z failed: {(e.stderr or e.stdout or str(e)).strip()}",
         )
+
+def _detect_single_root_dir(archive_path: Path) -> Optional[str]:
+    """
+    Inspect archive contents and return the single top-level component name
+    if (and only if) every entry starts with the same first path segment.
+    Uses `7z l -slt` for a parseable output.
+    """
+    try:
+        res = subprocess.run(
+            ["7z", "l", "-slt", str(archive_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        logging.warning("Failed to list archive for root detection: %s", e)
+        return None
+
+    top_levels = set()
+    for line in res.stdout.splitlines():
+        # Lines look like: "Path = dir/file.txt"
+        if line.startswith("Path = "):
+            rel = line[len("Path = "):].strip()
+            if not rel:
+                continue
+            # normalize separator to '/'
+            rel = rel.replace("\\", "/")
+            first = rel.split("/", 1)[0]
+            top_levels.add(first)
+
+            # If we ever see a top-level *file* (no '/'), that still counts as a top-level name,
+            # but it means the archive has root files, so there is not a single root directory "container".
+            # We'll keep collecting; decision happens after loop.
+
+            if len(top_levels) > 1:
+                # more than one top-level right away -> not a single root dir
+                return None
+
+    if len(top_levels) == 1:
+        return next(iter(top_levels))
+    return None
 
 
 # ---- Schemas ----
@@ -97,7 +137,7 @@ class UnzipReq(BaseModel):
     folder: str                 # directory under BASE_DIR where the archive resides
     archive_name: str           # e.g., "archive.zip" or "archive.7z"
     password: Optional[str] = None
-    dest_dir: Optional[str] = None  # subdir under OUT_DIR; default derived from archive name
+    dest_dir: Optional[str] = None  # subdir under OUT_DIR; default derived smartly
     overwrite: str = "skip"     # "skip" (-aos), "overwrite" (-aoa), or "rename" (-aou)
 
 
@@ -168,11 +208,20 @@ def unzip_archive(req: UnzipReq, authorization: Optional[str] = Header(default=N
     if not archive_path.exists() or not archive_path.is_file():
         raise HTTPException(status_code=404, detail="Archive file not found")
 
-    # Destination directory under OUT_DIR
+    # ---- NEW: smart destination to avoid double-nesting ----
     if req.dest_dir:
         dest = (OUT_DIR / req.dest_dir).resolve()
     else:
-        dest = (OUT_DIR / archive_path.stem).resolve()
+        embedded_root = _detect_single_root_dir(archive_path)
+        archive_stem = archive_path.stem
+
+        if embedded_root and embedded_root == archive_stem:
+            # The archive already contains a single top-level folder that matches the stem.
+            # Extract directly into OUT_DIR so we only get ONE folder (the embedded one).
+            dest = OUT_DIR
+        else:
+            # Otherwise, create a folder named after the archive to contain the files.
+            dest = (OUT_DIR / archive_stem).resolve()
 
     if not str(dest).startswith(str(OUT_DIR) + os.sep) and str(dest) != str(OUT_DIR):
         raise HTTPException(status_code=400, detail="Invalid destination path")
